@@ -140,221 +140,144 @@ def do_get(session: requests.Session, path: str, verify) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 # ─────────────────────────────────────────────
-# Extraction helpers  (adapt field names here if
-# the API ever changes its key names)
+# Extraction helpers — written to match exact
+# Maya API response shapes confirmed from debug
 # ─────────────────────────────────────────────
 
-def _extract_difficulty_counts(pc_json: Any) -> Dict[str, int]:
+def _extract_from_batch_current_user(batch_ranks_json: Any, roll_no: str) -> Dict[str, Any]:
     """
-    Tries several common shapes that Maya /get-student-problems-count
-    or /get-student-problems-count-dashboard might return:
-      { easy, medium, hard }
-      { easyCount, mediumCount, hardCount }
-      { data: { easy, medium, hard } }
-      list of { difficulty, count } objects
-    Returns a dict with keys: easy, medium, hard
+    batch-ranks returns:
+      {
+        "top5": [ ... ],
+        "current_user": [
+          {
+            "roll_no": "24P31A1224",
+            "problems_count": { "easy": 309, "medium": 59, "hard": 12 },
+            "score": 9260,
+            "rank": 55
+          }
+        ]
+      }
+    We read directly from current_user[0].
     """
-    result = {"easy": 0, "medium": 0, "hard": 0}
-    if not pc_json or not isinstance(pc_json, (dict, list)):
+    empty = {"easy": 0, "medium": 0, "hard": 0, "score": None, "rank": None}
+    if not batch_ranks_json or not isinstance(batch_ranks_json, dict):
+        return empty
+
+    current_user_list = batch_ranks_json.get("current_user", [])
+    if not isinstance(current_user_list, list) or not current_user_list:
+        return empty
+
+    cu = current_user_list[0]
+    if not isinstance(cu, dict):
+        return empty
+
+    pc = cu.get("problems_count", {})
+    return {
+        "easy":   int(pc.get("easy",   0) or 0),
+        "medium": int(pc.get("medium", 0) or 0),
+        "hard":   int(pc.get("hard",   0) or 0),
+        "score":  int(cu.get("score",  0) or 0),
+        "rank":   int(cu.get("rank",   0) or 0),
+    }
+
+
+def _extract_programming_languages(pc_json: Any) -> Dict[str, int]:
+    """
+    get-student-problems-count returns:
+      { "programmingLanguages": { "java": 76, "c": 169, "sql": 121 } }
+    """
+    if not pc_json or not isinstance(pc_json, dict):
+        return {}
+    langs = pc_json.get("programmingLanguages", {})
+    if not isinstance(langs, dict):
+        return {}
+    return {lang: int(cnt or 0) for lang, cnt in langs.items()}
+
+
+def _extract_streak_and_submissions(every_day_json: Any) -> Dict[str, Any]:
+    """
+    get-student-every-day-problems-count returns:
+      {
+        "formattedCounts": [
+          { "10-02-2026": 4 },
+          { "09-02-2026": 1 },
+          ...
+        ],
+        "submissions": {
+          "per_last_year":  67,
+          "per_last_month": 134,
+          "per_last_week":  9
+        }
+      }
+
+    Each item in formattedCounts is a single-key dict:
+      key   = "DD-MM-YYYY"
+      value = problem count for that day
+
+    Streak = longest unbroken run of consecutive days ending at
+             the most recent active date (≤ today).
+    """
+    result = {
+        "current_streak":  0,
+        "per_last_week":   0,
+        "per_last_month":  0,
+        "per_last_year":   0,
+    }
+
+    if not every_day_json or not isinstance(every_day_json, dict):
         return result
 
-    # Unwrap common wrappers
-    if isinstance(pc_json, dict):
-        if "data" in pc_json and isinstance(pc_json["data"], (dict, list)):
-            pc_json = pc_json["data"]
+    # ── Submissions summary ───────────────────────────────────────────────────
+    subs = every_day_json.get("submissions", {})
+    if isinstance(subs, dict):
+        result["per_last_week"]  = int(subs.get("per_last_week",  0) or 0)
+        result["per_last_month"] = int(subs.get("per_last_month", 0) or 0)
+        result["per_last_year"]  = int(subs.get("per_last_year",  0) or 0)
 
-    if isinstance(pc_json, list):
-        for item in pc_json:
-            if not isinstance(item, dict):
+    # ── Build active-date set from formattedCounts ────────────────────────────
+    formatted = every_day_json.get("formattedCounts", [])
+    if not isinstance(formatted, list):
+        return result
+
+    active_dates: set = set()
+    for entry in formatted:
+        if not isinstance(entry, dict):
+            continue
+        # Each entry has exactly one key: "DD-MM-YYYY" → count
+        for date_str, count in entry.items():
+            try:
+                cnt = int(count or 0)
+            except (TypeError, ValueError):
                 continue
-            diff = str(item.get("difficulty", item.get("level", ""))).lower()
-            cnt  = int(item.get("count", item.get("solved", item.get("total", 0))) or 0)
-            if diff in result:
-                result[diff] = cnt
-        return result
-
-    if isinstance(pc_json, dict):
-        # Try plain keys first
-        for key, alias in [("easy", ["easy", "easyCount", "Easy", "EASY"]),
-                           ("medium", ["medium", "mediumCount", "Medium", "MEDIUM"]),
-                           ("hard", ["hard", "hardCount", "Hard", "HARD"])]:
-            for a in alias:
-                if a in pc_json:
-                    result[key] = int(pc_json[a] or 0)
-                    break
-
-    return result
-
-
-def _extract_score(source: Any) -> Optional[int]:
-    """Look for a score / total_score / points field in various shapes."""
-    if isinstance(source, dict):
-        for k in ("score", "total_score", "totalScore", "points", "total_points"):
-            if k in source:
-                return int(source[k] or 0)
-        if "data" in source and isinstance(source["data"], dict):
-            return _extract_score(source["data"])
-    return None
-
-
-def _extract_rank(batch_ranks_json: Any, roll_no: str) -> Optional[int]:
-    """
-    batch_ranks response is typically a list of student objects.
-    Find the entry matching roll_no and return its rank (index+1 or explicit rank field).
-    """
-    if not batch_ranks_json:
-        return None
-
-    data = batch_ranks_json
-    if isinstance(data, dict):
-        data = data.get("data") or data.get("ranks") or data.get("students") or []
-
-    if not isinstance(data, list):
-        return None
-
-    # Sort by score descending if no explicit rank field
-    explicit_rank = any("rank" in (item if isinstance(item, dict) else {}) for item in data)
-
-    for idx, item in enumerate(data):
-        if not isinstance(item, dict):
-            continue
-        rn = item.get("roll_no") or item.get("rollNo") or item.get("roll_number") or ""
-        if str(rn).strip().lower() == roll_no.strip().lower():
-            if explicit_rank:
-                return int(item.get("rank", idx + 1))
-            return idx + 1          # position in the list (assumed sorted by score)
-
-    return None
-
-
-def _extract_problem_count_from_batch(batch_ranks_json: Any, roll_no: str) -> Dict[str, int]:
-    """
-    Some Maya setups store per-student difficulty breakdown inside the batch-ranks list.
-    """
-    result = {"easy": 0, "medium": 0, "hard": 0}
-    if not batch_ranks_json:
-        return result
-
-    data = batch_ranks_json
-    if isinstance(data, dict):
-        data = data.get("data") or data.get("ranks") or data.get("students") or []
-
-    if not isinstance(data, list):
-        return result
-
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        rn = item.get("roll_no") or item.get("rollNo") or item.get("roll_number") or ""
-        if str(rn).strip().lower() == roll_no.strip().lower():
-            result["easy"]   = int(item.get("easy",   item.get("easyCount",   0)) or 0)
-            result["medium"] = int(item.get("medium", item.get("mediumCount", 0)) or 0)
-            result["hard"]   = int(item.get("hard",   item.get("hardCount",   0)) or 0)
-            break
-
-    return result
-
-
-def _extract_programming_languages(source_json: Any) -> Dict[str, int]:
-    """
-    Looks for a programmingLanguages / programming_languages dict.
-    Searches both top-level and inside common wrappers.
-    """
-    if not source_json:
-        return {}
-
-    def _find(obj):
-        if isinstance(obj, dict):
-            for k in ("programmingLanguages", "programming_languages", "languages", "languageCounts"):
-                if k in obj and isinstance(obj[k], dict):
-                    return {lang: int(cnt or 0) for lang, cnt in obj[k].items()}
-            # recurse one level into common wrappers
-            for k in ("data", "student", "result"):
-                if k in obj:
-                    found = _find(obj[k])
-                    if found:
-                        return found
-        return {}
-
-    return _find(source_json)
-
-
-def _extract_streak(every_day_json: Any) -> int:
-    """
-    Computes the current streak from get-student-every-day-problems-count.
-
-    Strategy:
-      1. Parse every entry into (date, count) pairs.
-      2. Keep only dates where count > 0  →  these are "active days".
-      3. Sort active dates descending (newest first).
-      4. Walk backwards day-by-day: as long as each next expected date is
-         present in the active-date set, increment the streak.
-      5. Allow today to be missing (student may not have solved yet today)
-         so we start from the most recent active date ≤ today.
-    """
-    if not every_day_json:
-        return 0
-
-    # Unwrap common response wrappers
-    data = every_day_json
-    if isinstance(data, dict):
-        # Try explicit streak field first
-        for k in ("streak", "currentStreak", "current_streak"):
-            if k in data:
-                return int(data[k] or 0)
-        data = data.get("data") or data.get("counts") or data.get("days") or []
-
-    if not isinstance(data, list) or not data:
-        return 0
-
-    # ── Build a set of active dates (count > 0) ──────────────────────────────
-    active_dates = set()
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-
-        # Date field: "date" | "day" | "_id" | "createdAt"
-        raw_date = (item.get("date") or item.get("day") or
-                    item.get("_id")  or item.get("createdAt") or "")
-        # Count field: "count" | "solved" | "total" | "problemCount"
-        raw_count = (item.get("count") or item.get("solved") or
-                     item.get("total") or item.get("problemCount") or 0)
-
-        try:
-            count = int(raw_count)
-        except (TypeError, ValueError):
-            count = 0
-
-        if count <= 0:
-            continue
-
-        # Parse date – handles "2024-05-20", "2024-05-20T00:00:00.000Z", timestamps
-        try:
-            d = datetime.fromisoformat(str(raw_date)[:10]).date()
-            active_dates.add(d)
-        except (ValueError, TypeError):
-            continue
+            if cnt <= 0:
+                continue
+            try:
+                # Parse "DD-MM-YYYY"
+                day, month, year = date_str.split("-")
+                d = datetime(int(year), int(month), int(day)).date()
+                active_dates.add(d)
+            except (ValueError, AttributeError):
+                continue
 
     if not active_dates:
-        return 0
+        return result
 
-    # ── Walk backwards from most-recent active date ≤ today ─────────────────
-    today         = datetime.utcnow().date()
-    most_recent   = max(active_dates)
+    # ── Walk backwards from most-recent active date ≤ today ──────────────────
+    today       = datetime.utcnow().date()
+    most_recent = max(d for d in active_dates if d <= today) if any(d <= today for d in active_dates) else None
 
-    # If the most recent activity is in the future (timezone edge), clamp to today
-    if most_recent > today:
-        most_recent = today
+    if most_recent is None:
+        return result
 
-    # Start counting from the most recent active day
-    streak   = 0
-    check    = most_recent
-
+    streak = 0
+    check  = most_recent
     while check in active_dates:
         streak += 1
-        check  -= timedelta(days=1)   # step one day back
+        check  -= timedelta(days=1)
 
-    return streak
+    result["current_streak"] = streak
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -395,69 +318,32 @@ def login_and_aggregate(roll_no: str, password: str) -> Dict[str, Any]:
         r_ranks = do_post(session, ENDPOINTS["batch_ranks"],
                           {"roll_no": roll_no, "batch": batch_id}, verify)
 
-    # ── extract difficulty counts ────────────────────────────────────────────
-    # Priority: batch_ranks (has per-student breakdown) > problems_count_dashboard > problems_count
-    diff = {"easy": 0, "medium": 0, "hard": 0}
-
-    if r_ranks and r_ranks.get("json"):
-        diff_from_batch = _extract_problem_count_from_batch(r_ranks["json"], roll_no)
-        if any(diff_from_batch.values()):
-            diff = diff_from_batch
-
-    if not any(diff.values()) and r_pcd.get("json"):
-        diff = _extract_difficulty_counts(r_pcd["json"])
-
-    if not any(diff.values()) and r_pc.get("json"):
-        diff = _extract_difficulty_counts(r_pc["json"])
-
-    easy   = diff["easy"]
-    medium = diff["medium"]
-    hard   = diff["hard"]
+    # ── extract from batch_ranks → current_user (authoritative source) ───────
+    batch_data = _extract_from_batch_current_user(
+        r_ranks.get("json") if r_ranks else None, roll_no
+    )
+    easy   = batch_data["easy"]
+    medium = batch_data["medium"]
+    hard   = batch_data["hard"]
     total  = easy + medium + hard
+    score  = batch_data["score"]
+    rank   = batch_data["rank"] or None
 
-    # ── extract score ────────────────────────────────────────────────────────
-    score = None
-    for src in [r_pcd.get("json"), r_pc.get("json"), r_user.get("json")]:
-        score = _extract_score(src)
-        if score is not None:
-            break
+    # ── extract programming languages from get-student-problems-count ─────────
+    prog_langs = _extract_programming_languages(r_pc.get("json"))
 
-    # Also try finding this student's score inside batch_ranks list
-    if score is None and r_ranks and r_ranks.get("json"):
-        data = r_ranks["json"]
-        if isinstance(data, dict):
-            data = data.get("data") or data.get("ranks") or data.get("students") or []
-        if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                rn = item.get("roll_no") or item.get("rollNo") or ""
-                if str(rn).strip().lower() == roll_no.strip().lower():
-                    score = _extract_score(item)
-                    break
-
-    # ── extract rank ─────────────────────────────────────────────────────────
-    rank = None
-    if r_ranks and r_ranks.get("json"):
-        rank = _extract_rank(r_ranks["json"], roll_no)
-
-    # ── extract programming languages ────────────────────────────────────────
-    prog_langs: Dict[str, int] = {}
-    for src in [r_user.get("json"), r_pcd.get("json"), r_pc.get("json")]:
-        prog_langs = _extract_programming_languages(src)
-        if prog_langs:
-            break
-
-    # ── extract streak ───────────────────────────────────────────────────────
-    streak = _extract_streak(r_edc.get("json"))
+    # ── extract streak + submission stats from every-day-counts ──────────────
+    streak_data = _extract_streak_and_submissions(r_edc.get("json"))
 
     # ── assemble clean output ────────────────────────────────────────────────
     summary = {
-        "ok":        True,
-        "roll_no":   roll_no,
+        "ok":         True,
+        "roll_no":    roll_no,
         "student_id": student_id,
-        "batch_id":  batch_id,
-        # ─── main stats ───────────────────────────────
+        "batch_id":   batch_id,
+        "name":       (r_user.get("json") or {}).get("first_name", ""),
+        "college":    (r_user.get("json") or {}).get("college", ""),
+        # ─── problem stats (from batch_ranks → current_user) ──────────────
         "problems": {
             "easy":   easy,
             "medium": medium,
@@ -466,9 +352,14 @@ def login_and_aggregate(roll_no: str, password: str) -> Dict[str, Any]:
         },
         "score": score,
         "rank":  rank,
+        # ─── languages (from get-student-problems-count) ──────────────────
         "programmingLanguages": prog_langs,
+        # ─── streak + submissions (from every-day-counts) ─────────────────
         "streak": {
-            "current_streak": streak,
+            "current_streak":  streak_data["current_streak"],
+            "per_last_week":   streak_data["per_last_week"],
+            "per_last_month":  streak_data["per_last_month"],
+            "per_last_year":   streak_data["per_last_year"],
         },
         "_fetched_at": datetime.utcnow().isoformat(),
     }
@@ -602,6 +493,58 @@ def api_cache_clear():
             return jsonify({"ok": False, "error": str(e)}), 500
     clear_all_cache()
     return jsonify({"ok": True, "cleared_all": True}), 200
+
+
+@app.route("/api/debug", methods=["POST"])
+def api_debug():
+    """
+    Returns the RAW JSON from every Maya endpoint.
+    Use this to inspect exact field names for streak / rank.
+
+    POST: { "roll_no": "24P31A1224", "password": "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    roll = body.get("roll_no")  or os.getenv("MAYA_USER")
+    pwd  = body.get("password") or os.getenv("MAYA_PASS")
+
+    if not roll or not pwd:
+        return jsonify({"ok": False, "error": "credentials_missing"}), 400
+
+    verify  = False if DISABLE_SSL_VERIFY else certifi.where()
+    session = build_session()
+
+    res_login = do_post(session, LOGIN_PATH,
+                        {"roll_no": roll, "password": pwd, "forcelogin": True},
+                        verify)
+    if not res_login.get("ok") or res_login.get("status_code") != 200:
+        return jsonify({"ok": False, "stage": "login", "detail": res_login}), 500
+
+    login_json = res_login.get("json") or {}
+    student_id = login_json.get("student_id") or login_json.get("_id")
+
+    raw = {
+        "student_id":               student_id,
+        "problems_count":           do_post(session, ENDPOINTS["problems_count"],           {"roll_no": roll}, verify).get("json"),
+        "problems_count_dashboard": do_post(session, ENDPOINTS["problems_count_dashboard"], {"roll_no": roll}, verify).get("json"),
+        "every_day_counts":         do_post(session, ENDPOINTS["every_day_counts"],         {"roll_no": roll}, verify).get("json"),
+    }
+
+    if student_id:
+        r_user            = do_get(session, f"{ENDPOINTS['user_by_id']}/{student_id}", verify)
+        raw["user_by_id"] = r_user.get("json")
+
+        u        = r_user.get("json") or {}
+        cp       = u.get("current_program") or u.get("current_courses") or []
+        batch_id = None
+        if isinstance(cp, list) and cp:
+            batch_id = cp[0].get("batch") or cp[0].get("batch_id")
+
+        if batch_id:
+            raw["batch_ranks"]   = do_post(session, ENDPOINTS["batch_ranks"],
+                                           {"roll_no": roll, "batch": batch_id}, verify).get("json")
+            raw["batch_id_used"] = batch_id
+
+    return jsonify({"ok": True, "raw": raw}), 200
 
 
 # ─────────────────────────────────────────────
