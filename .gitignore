@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+
+# Virtual env
+venv/
+.env
+
+# Cache & logs
+cache/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
