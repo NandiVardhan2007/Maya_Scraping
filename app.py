@@ -16,10 +16,14 @@ from typing import Optional, Dict, Any, List
 
 import certifi
 import requests
+import urllib3
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
+
+# Suppress SSL warnings (since we're disabling SSL verification for MAYA)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 load_dotenv()
 
@@ -228,106 +232,121 @@ def _extract_streak_and_submissions(every_day_json: Any) -> Dict[str, Any]:
     if not every_day_json or not isinstance(every_day_json, dict):
         return result
 
-    # ── Submissions summary ───────────────────────────────────────────────────
+    # ── submissions timeline ──────────────────────────────────────────────────
     subs = every_day_json.get("submissions", {})
     if isinstance(subs, dict):
         result["per_last_week"]  = int(subs.get("per_last_week",  0) or 0)
         result["per_last_month"] = int(subs.get("per_last_month", 0) or 0)
         result["per_last_year"]  = int(subs.get("per_last_year",  0) or 0)
 
-    # ── Build active-date set from formattedCounts ────────────────────────────
-    formatted = every_day_json.get("formattedCounts", [])
-    if not isinstance(formatted, list):
+    # ── compute current_streak from formattedCounts ───────────────────────────
+    fc = every_day_json.get("formattedCounts", [])
+    if not isinstance(fc, list):
         return result
 
-    active_dates: set = set()
-    for entry in formatted:
-        if not isinstance(entry, dict):
+    date_to_count = {}
+    for item in fc:
+        if not isinstance(item, dict):
             continue
-        # Each entry has exactly one key: "DD-MM-YYYY" → count
-        for date_str, count in entry.items():
+        for date_str, count in item.items():
             try:
-                cnt = int(count or 0)
-            except (TypeError, ValueError):
-                continue
-            if cnt <= 0:
-                continue
-            try:
-                # Parse "DD-MM-YYYY"
-                day, month, year = date_str.split("-")
-                d = datetime(int(year), int(month), int(day)).date()
-                active_dates.add(d)
-            except (ValueError, AttributeError):
-                continue
+                dt = datetime.strptime(date_str, "%d-%m-%Y").date()
+                date_to_count[dt] = int(count or 0)
+            except Exception:
+                pass
 
-    if not active_dates:
+    if not date_to_count:
         return result
 
-    # ── Walk backwards from most-recent active date ≤ today ──────────────────
-    today       = datetime.utcnow().date()
-    most_recent = max(d for d in active_dates if d <= today) if any(d <= today for d in active_dates) else None
+    today = datetime.utcnow().date()
+    dates_sorted = sorted(date_to_count.keys(), reverse=True)
 
-    if most_recent is None:
+    # Find the most recent date (≤ today) with a submission
+    recent = None
+    for d in dates_sorted:
+        if d <= today and date_to_count[d] > 0:
+            recent = d
+            break
+
+    if not recent:
+        result["current_streak"] = 0
         return result
 
+    # Walk backwards day-by-day from 'recent'
+    current_day = recent
     streak = 0
-    check  = most_recent
-    while check in active_dates:
+    while current_day in date_to_count and date_to_count[current_day] > 0:
         streak += 1
-        check  -= timedelta(days=1)
+        current_day -= timedelta(days=1)
 
     result["current_streak"] = streak
     return result
 
 
 # ─────────────────────────────────────────────
-# Core: login + aggregate → clean summary
+# Main aggregation logic
 # ─────────────────────────────────────────────
 def login_and_aggregate(roll_no: str, password: str) -> Dict[str, Any]:
+    """
+    Login to MAYA, scrape all endpoints, and return a clean summary
+    """
     verify = False if DISABLE_SSL_VERIFY else certifi.where()
-
     session = build_session()
+
     logger.info("Logging in %s", roll_no)
+
+    # ── login ────────────────────────────────────────────────────────────────
     res_login = do_post(session, LOGIN_PATH,
                         {"roll_no": roll_no, "password": password, "forcelogin": True},
                         verify)
 
     if not res_login.get("ok") or res_login.get("status_code") != 200:
-        return {"ok": False, "stage": "login", "detail": res_login}
+        return {"ok": False, "error": "login_failed", "detail": res_login}
 
-    login_json  = res_login.get("json") or {}
-    student_id  = login_json.get("student_id") or login_json.get("_id")
+    login_json = res_login.get("json") or {}
+    student_id = login_json.get("student_id") or login_json.get("_id")
 
-    # ── fetch all endpoints ──────────────────────────────────────────────────
-    r_pc        = do_post(session, ENDPOINTS["problems_count"],           {"roll_no": roll_no}, verify)
-    r_pcd       = do_post(session, ENDPOINTS["problems_count_dashboard"], {"roll_no": roll_no}, verify)
-    r_edc       = do_post(session, ENDPOINTS["every_day_counts"],         {"roll_no": roll_no}, verify)
+    if not student_id:
+        return {"ok": False, "error": "no_student_id", "detail": login_json}
 
-    r_user      = {"ok": False, "note": "student_id_missing"}
-    r_ranks     = None
-    batch_id    = None
+    # ── user_by_id (profile, batch_id) ──────────────────────────────────────
+    r_user = do_get(session, f"{ENDPOINTS['user_by_id']}/{student_id}", verify)
+    if not r_user.get("ok") or r_user.get("status_code") != 200:
+        return {"ok": False, "error": "failed_to_fetch_user", "detail": r_user}
 
-    if student_id:
-        r_user  = do_get(session, f"{ENDPOINTS['user_by_id']}/{student_id}", verify)
-        u       = (r_user.get("json") or {})
-        cp      = u.get("current_program") or u.get("current_courses") or []
-        if isinstance(cp, list) and cp:
-            batch_id = cp[0].get("batch") or cp[0].get("batch_id")
+    user_json = r_user.get("json") or {}
+    current_program = user_json.get("current_program") or user_json.get("current_courses") or []
 
-    if batch_id:
-        r_ranks = do_post(session, ENDPOINTS["batch_ranks"],
-                          {"roll_no": roll_no, "batch": batch_id}, verify)
+    batch_id = None
+    if isinstance(current_program, list) and current_program:
+        batch_id = current_program[0].get("batch") or current_program[0].get("batch_id")
 
-    # ── extract from batch_ranks → current_user (authoritative source) ───────
-    batch_data = _extract_from_batch_current_user(
-        r_ranks.get("json") if r_ranks else None, roll_no
-    )
-    easy   = batch_data["easy"]
-    medium = batch_data["medium"]
-    hard   = batch_data["hard"]
+    if not batch_id:
+        return {"ok": False, "error": "no_batch_id", "detail": user_json}
+
+    # ── batch_ranks (easy, medium, hard, score, rank) ────────────────────────
+    r_br = do_post(session, ENDPOINTS["batch_ranks"],
+                   {"roll_no": roll_no, "batch": batch_id}, verify)
+    if not r_br.get("ok") or r_br.get("status_code") != 200:
+        return {"ok": False, "error": "batch_ranks_failed", "detail": r_br}
+
+    stats_from_batch = _extract_from_batch_current_user(r_br.get("json"), roll_no)
+    easy   = stats_from_batch["easy"]
+    medium = stats_from_batch["medium"]
+    hard   = stats_from_batch["hard"]
     total  = easy + medium + hard
-    score  = batch_data["score"]
-    rank   = batch_data["rank"] or None
+    score  = stats_from_batch["score"]
+    rank   = stats_from_batch["rank"]
+
+    # ── get-student-problems-count (programming languages) ───────────────────
+    r_pc = do_post(session, ENDPOINTS["problems_count"], {"roll_no": roll_no}, verify)
+    if not r_pc.get("ok") or r_pc.get("status_code") != 200:
+        return {"ok": False, "error": "problems_count_failed", "detail": r_pc}
+
+    # ── get-student-every-day-problems-count (streak, submissions) ───────────
+    r_edc = do_post(session, ENDPOINTS["every_day_counts"], {"roll_no": roll_no}, verify)
+    if not r_edc.get("ok") or r_edc.get("status_code") != 200:
+        return {"ok": False, "error": "every_day_counts_failed", "detail": r_edc}
 
     # ── extract programming languages from get-student-problems-count ─────────
     prog_langs = _extract_programming_languages(r_pc.get("json"))
